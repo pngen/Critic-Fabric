@@ -132,6 +132,7 @@ if(CRITIC_FABRIC_BUILD_TESTS)
         tests/test_coordinator.cpp
         tests/test_hardening.cpp
         tests/test_concurrency.cpp
+        tests/test_regression.cpp
         tests/test_support.cpp)
     target_link_libraries(critic_fabric_tests PRIVATE CriticFabric::critic_fabric)
     target_include_directories(critic_fabric_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)

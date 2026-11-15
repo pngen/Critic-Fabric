@@ -40,8 +40,11 @@ enum class JournalRecordType : std::uint16_t {
     ReviewStateChanged = 13,
     DecisionCommitted = 14,
     AssignmentUpdated = 15,
+    // A worker incarnation was fenced: its boot identity is retired for good.
+    // The payload is the fenced worker record.
+    WorkerFenced = 16,
 };
-inline constexpr std::uint16_t kJournalRecordTypeMax = 15;
+inline constexpr std::uint16_t kJournalRecordTypeMax = 16;
 
 const char* to_string(JournalRecordType type) noexcept;
 bool is_valid_journal_record_type(std::uint16_t raw) noexcept;

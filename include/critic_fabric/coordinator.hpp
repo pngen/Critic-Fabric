@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -152,7 +153,10 @@ private:
     ReviewSlot* find_slot_locked(ReviewId id);
     const ReviewSlot* find_slot_locked(ReviewId id) const;
     const CriticAssignment* find_active_assignment_locked(const ReviewSlot& slot, CriticId critic) const;
-    Status fence_worker_locked(WorkerId worker, std::string reason, std::vector<JournalEntry>& entries);
+    // superseded: a later incarnation of the same critic takes over, so even
+    // assignments the fenced incarnation already discharged are retired.
+    Status fence_worker_locked(WorkerId worker, std::string reason, std::vector<JournalEntry>& entries,
+                               bool superseded = false);
     Status revalidate_review_locked(ReviewSlot& slot, std::string reason, std::vector<JournalEntry>& entries);
     std::vector<JournalEntry> supersede_reviews_for_target_locked(TargetId target,
                                                                   TargetGeneration previous_generation);
@@ -182,6 +186,9 @@ private:
     std::map<CriticId, CriticRegistration> critics_;
     std::map<WorkerId, WorkerRecord> workers_;
     std::map<CriticId, WorkerId> incumbents_;
+    // Worker incarnations (identity, boot) that were fenced. A retired boot can
+    // never declare readiness again; only a fresh boot identity can.
+    std::set<std::pair<WorkerId, WorkerBootId>> retired_boots_;
     std::map<ReviewId, ReviewSlot> reviews_;
     std::map<ReviewRequestId, ReviewId> review_requests_;
     std::uint64_t next_order_ = 1;

@@ -102,6 +102,14 @@ bool assignment_is_discharged(const std::map<FindingId, Finding>& findings, Crit
     return false;
 }
 
+// Keeps an identity allocator ahead of every identity in use, including one a
+// caller chose explicitly: an allocated identity must never land on it.
+void advance_allocator(std::uint64_t& next, std::uint64_t used) noexcept {
+    if (used >= next && used != UINT64_MAX) {
+        next = used + 1;
+    }
+}
+
 bool same_evidence_set(const std::vector<EvidenceId>& a, const std::vector<EvidenceId>& b) {
     if (a.size() != b.size()) {
         return false;
@@ -219,6 +227,7 @@ void Coordinator::apply_entry_locked(const JournalEntry& entry) {
             break;
         case JournalRecordType::TargetRegistered:
             targets_[entry.target.id] = entry.target;
+            advance_allocator(next_target_id_, entry.target.id.value());
             break;
         case JournalRecordType::TargetSuperseded: {
             const TargetRecord previous = entry.previous_target;
@@ -226,13 +235,19 @@ void Coordinator::apply_entry_locked(const JournalEntry& entry) {
                 target_history_[previous.id][previous.generation] = previous;
             }
             targets_[entry.target.id] = entry.target;
+            advance_allocator(next_target_id_, entry.target.id.value());
             break;
         }
         case JournalRecordType::CriticRegistered:
             critics_[entry.critic.id] = entry.critic;
+            advance_allocator(next_critic_id_, entry.critic.id.value());
             break;
+        case JournalRecordType::WorkerFenced:
+            retired_boots_.insert({entry.worker.id, entry.worker.boot});
+            [[fallthrough]];
         case JournalRecordType::WorkerRegistered: {
             workers_[entry.worker.id] = entry.worker;
+            advance_allocator(next_worker_id_, entry.worker.id.value());
             const auto incumbent = incumbents_.find(entry.worker.critic);
             if (incumbent == incumbents_.end()) {
                 incumbents_[entry.worker.critic] = entry.worker.id;
@@ -469,6 +484,7 @@ Status Coordinator::start() {
         critics_.clear();
         workers_.clear();
         incumbents_.clear();
+        retired_boots_.clear();
         reviews_.clear();
         review_requests_.clear();
         next_order_ = 1;
@@ -715,23 +731,27 @@ Status Coordinator::check_authority_locked(const AuthorityContext& authority, Re
 }
 
 Status Coordinator::fence_worker_locked(WorkerId worker, std::string reason,
-                                        std::vector<JournalEntry>& entries) {
+                                        std::vector<JournalEntry>& entries, bool superseded) {
     const auto it = workers_.find(worker);
     if (it == workers_.end()) {
         return Status::error(ErrorCode::WorkerNotRegistered, "cannot fence an unregistered worker incarnation");
     }
     const WorkerRecord previous = it->second;
-    if (!previous.authoritative && !previous.ready && !previous.healthy) {
-        return Status::success();
+    const bool live = previous.authoritative || previous.ready || previous.healthy;
+    const bool retired = retired_boots_.count({previous.id, previous.boot}) != 0;
+    if (live || !retired) {
+        // The boot identity is retired durably, also for an incarnation that is
+        // not live (never ready, or recovered after a restart): a fenced
+        // incarnation can never declare readiness again.
+        WorkerRecord fenced = previous;
+        fenced.ready = false;
+        fenced.healthy = false;
+        fenced.authoritative = false;
+        JournalEntry worker_entry;
+        worker_entry.type = JournalRecordType::WorkerFenced;
+        worker_entry.worker = fenced;
+        entries.push_back(worker_entry);
     }
-    WorkerRecord fenced = previous;
-    fenced.ready = false;
-    fenced.healthy = false;
-    fenced.authoritative = false;
-    JournalEntry worker_entry;
-    worker_entry.type = JournalRecordType::WorkerRegistered;
-    worker_entry.worker = fenced;
-    entries.push_back(worker_entry);
 
     for (auto& review_entry : reviews_) {
         ReviewSlot& slot = review_entry.second;
@@ -744,9 +764,10 @@ Status Coordinator::fence_worker_locked(WorkerId worker, std::string reason,
             if (assignment.worker != previous.id || assignment.worker_boot != previous.boot) {
                 continue;
             }
-            if (assignment_is_discharged(slot.findings, assignment.id)) {
+            if (!superseded && assignment_is_discharged(slot.findings, assignment.id)) {
                 // The incarnation already published a current finding, so the
                 // assignment is complete. Only its right to publish more is lost.
+                // (A later incarnation superseding it ends that protection.)
                 continue;
             }
             assignment.active = false;
@@ -1293,7 +1314,8 @@ Result<WorkerRecord> Coordinator::register_worker(const RegisterWorkerRequest& r
         if (existing_it != workers_.end()) {
             record.boot_order = next_boot_order_++;
             Status status = fence_worker_locked(
-                record.id, "worker re-registered under a fresh boot identity; revalidation is required", entries);
+                record.id, "worker re-registered under a fresh boot identity; revalidation is required", entries,
+                true);
             if (!status.ok()) {
                 return status;
             }
@@ -1309,17 +1331,19 @@ Result<WorkerRecord> Coordinator::register_worker(const RegisterWorkerRequest& r
         }
 
         // A second process claiming the same logical critic identity supersedes
-        // the previous incarnation rather than adding a second vote.
+        // the previous incarnations rather than adding a second vote. Work an
+        // older incarnation published (even one that already exited) no longer
+        // belongs to the authority chain, so its assignments are retired and the
+        // critic can be reassigned under the new incarnation.
         std::vector<WorkerId> competing;
         for (const auto& worker_entry : workers_) {
-            if (worker_entry.first != record.id && worker_entry.second.critic == record.critic &&
-                worker_entry.second.authoritative) {
+            if (worker_entry.first != record.id && worker_entry.second.critic == record.critic) {
                 competing.push_back(worker_entry.first);
             }
         }
         for (WorkerId competitor : competing) {
             Status status = fence_worker_locked(
-                competitor, "another worker incarnation claimed this critic identity", entries);
+                competitor, "another worker incarnation claimed this critic identity", entries, true);
             if (!status.ok()) {
                 return status;
             }
@@ -1367,6 +1391,11 @@ Result<WorkerRecord> Coordinator::declare_readiness(const DeclareReadinessReques
         if (worker_it->second.boot != request.boot) {
             return Status::error(ErrorCode::StaleWorkerBoot,
                                  "readiness carries a superseded worker boot identity");
+        }
+        if (retired_boots_.count({request.id, request.boot}) != 0) {
+            return Status::error(ErrorCode::StaleWorkerBoot,
+                                 "this worker incarnation was fenced; its boot identity is retired and only a "
+                                 "fresh incarnation may declare readiness");
         }
         if (worker_it->second.critic != request.critic) {
             return Status::error(ErrorCode::CriticNotAuthoritative,
@@ -1999,6 +2028,11 @@ Result<Finding> Coordinator::submit_finding(const SubmitFindingRequest& request)
             const Finding& existing = finding_entry.second;
             if (existing.critic != request.critic ||
                 existing.review_generation != slot->record.generation) {
+                continue;
+            }
+            if (request.supersedes.valid() && existing.id == request.supersedes) {
+                // The finding being superseded explicitly is the documented way
+                // to revise an outcome; it is not a conflict.
                 continue;
             }
             if (!finding_state_is_current(existing.state)) {

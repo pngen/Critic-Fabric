@@ -189,6 +189,7 @@ const char* to_string(JournalRecordType type) noexcept {
         case JournalRecordType::ReviewStateChanged: return "REVIEW_STATE_CHANGED";
         case JournalRecordType::DecisionCommitted: return "DECISION_COMMITTED";
         case JournalRecordType::AssignmentUpdated: return "ASSIGNMENT_UPDATED";
+        case JournalRecordType::WorkerFenced: return "WORKER_FENCED";
     }
     return "INVALID";
 }
@@ -258,6 +259,7 @@ void encode(ByteWriter& writer, const JournalEntry& value) {
             encode(writer, value.critic);
             break;
         case JournalRecordType::WorkerRegistered:
+        case JournalRecordType::WorkerFenced:
             encode(writer, value.worker);
             break;
         case JournalRecordType::ReviewDeclared:
@@ -330,6 +332,7 @@ Status decode(ByteReader& reader, JournalEntry& out, const RuntimeLimits& limits
             status = decode(reader, out.critic, limits);
             break;
         case JournalRecordType::WorkerRegistered:
+        case JournalRecordType::WorkerFenced:
             status = decode(reader, out.worker, limits);
             break;
         case JournalRecordType::ReviewDeclared:
